@@ -1,0 +1,80 @@
+#cloud-config
+# First-boot setup for a lab VM. vm.sh substitutes the hostname and SSH key
+# placeholders.
+hostname: @HOSTNAME@
+
+users:
+  - name: lab
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - "@SSH_KEY@"
+
+# Packages are installed from runcmd after outbound IPv4 works. Early apt often
+# fails on libvirt NAT (IPv6 preferred but unreachable; IPv4 not ready yet).
+
+write_files:
+  # Memory registration pins pages; the default memlock limit is too small.
+  - path: /etc/security/limits.d/90-rdma.conf
+    content: |
+      * soft memlock unlimited
+      * hard memlock unlimited
+  - path: /usr/local/sbin/rxe-up
+    permissions: "0755"
+    content: |
+      #!/bin/sh
+      set -eu
+      modprobe rdma_rxe
+      [ -d /sys/class/infiniband/rxe0 ] && exit 0
+      dev="$(ip -o route show default | awk '{print $5; exit}')"
+      rdma link add rxe0 type rxe netdev "${dev}"
+  - path: /etc/systemd/system/rxe.service
+    content: |
+      [Unit]
+      Description=Soft-RoCE device rxe0
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/rxe-up
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /usr/local/sbin/rdma-lab-firstboot
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      # Prefer IPv4: guests often get AAAA answers but no working IPv6 via NAT.
+      echo 'Acquire::ForceIPv4 "true";' >/etc/apt/apt.conf.d/99force-ipv4
+      timedatectl set-ntp true 2>/dev/null || true
+      echo "waiting for outbound IPv4..."
+      for _ in $(seq 1 120); do
+        if ping -4 -c1 -W2 1.1.1.1 >/dev/null 2>&1 \
+          || curl -4 -fsS --connect-timeout 3 -o /dev/null http://archive.ubuntu.com/ubuntu/; then
+          break
+        fi
+        sleep 2
+      done
+      if ! ping -4 -c1 -W2 1.1.1.1 >/dev/null 2>&1 \
+        && ! curl -4 -fsS --connect-timeout 5 -o /dev/null http://archive.ubuntu.com/ubuntu/; then
+        echo "no outbound IPv4 from guest; fix host libvirt NAT/firewall, then rerun:" >&2
+        echo "  sudo /usr/local/sbin/rdma-lab-firstboot" >&2
+        exit 1
+      fi
+      apt-get update -y
+      apt-get install -y rdma-core ibverbs-utils rdmacm-utils perftest
+      if ! modprobe rdma_rxe 2>/dev/null; then
+        apt-get install -y "linux-modules-extra-$(uname -r)"
+        modprobe rdma_rxe
+      fi
+      systemctl daemon-reload
+      systemctl enable --now rxe.service
+      rdma link show
+
+runcmd:
+  - [/usr/local/sbin/rdma-lab-firstboot]
